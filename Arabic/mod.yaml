@@ -1,0 +1,8 @@
+title: "Arabic RTL"
+description: "Adds Right-to-Left support for Arabic text in Oxygen Not Included."
+staticID: Arabic
+version: "1.2.0"
+minimumSupportedBuild: 469473
+supportedContent: ALL
+authors:
+  - DiNaSoR
