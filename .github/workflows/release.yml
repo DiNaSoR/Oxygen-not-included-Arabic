@@ -37,12 +37,14 @@ jobs:
           fetch-depth: 0
 
       # -------------------------------------------------------------------
-      # 2. Install gettext (for msgfmt --statistics) and zip
+      # 2. Install zip (gettext is no longer required — we parse the .po
+      #    directly with awk because ONI's strings.po uses a non-standard
+      #    header that confuses `msgfmt --statistics`.)
       # -------------------------------------------------------------------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gettext zip
+          sudo apt-get install -y --no-install-recommends zip
 
       # -------------------------------------------------------------------
       # 3. Resolve the release tag (from push event or manual input)
@@ -103,25 +105,53 @@ jobs:
 
       # -------------------------------------------------------------------
       # 6. Compute translation coverage stats (now vs previous tag)
+      #
+      # Pure awk so it doesn't depend on `msgfmt` and tolerates ONI's
+      # non-standard .po header. Outputs three integers: translated, fuzzy,
+      # untranslated. The empty-msgid header entry is skipped.
       # -------------------------------------------------------------------
       - name: Compute translation stats
         id: stats
         run: |
-          stats_line() { msgfmt --statistics -o /dev/null "$1" 2>&1 | head -n1; }
-          field()      { echo "$2" | grep -oE "[0-9]+ $1" | grep -oE '^[0-9]+' || echo 0; }
+          po_stats() {
+            awk '
+              function flush() {
+                if (msgid_seen && !is_header) {
+                  if (is_fuzzy)      fuzzy++
+                  else if (has_text) trans++
+                  else               untrans++
+                }
+                msgid_seen=0; has_text=0; is_fuzzy=0; in_msgstr=0; is_header=0
+              }
+              BEGIN { trans=0; fuzzy=0; untrans=0 }
+              /^#, fuzzy/                   { is_fuzzy=1; next }
+              /^msgid "/ {
+                flush()
+                msgid_seen=1
+                is_header  = ($0 == "msgid \"\"")
+                in_msgstr  = 0
+                next
+              }
+              /^msgstr "/ {
+                in_msgstr = 1
+                if ($0 != "msgstr \"\"") has_text = 1
+                next
+              }
+              in_msgstr && /^"/ {
+                if (length($0) > 2) has_text = 1
+                next
+              }
+              /^[[:space:]]*$/              { flush() }
+              END { flush(); printf "%d %d %d\n", trans, fuzzy, untrans }
+            ' "$1"
+          }
 
-          NOW_LINE=$(stats_line Arabic/strings.po)
-          NOW_TRANS=$(field translated   "$NOW_LINE")
-          NOW_FUZZY=$(field fuzzy        "$NOW_LINE")
-          NOW_UNTR=$(field  untranslated "$NOW_LINE")
+          read NOW_TRANS NOW_FUZZY NOW_UNTR <<<"$(po_stats Arabic/strings.po)"
           NOW_TOTAL=$((NOW_TRANS + NOW_FUZZY + NOW_UNTR))
 
           PREV_REF="${{ steps.prev.outputs.ref }}"
           if [ -n "$PREV_REF" ] && git show "$PREV_REF:Arabic/strings.po" > /tmp/prev.po 2>/dev/null; then
-            PREV_LINE=$(stats_line /tmp/prev.po)
-            PREV_TRANS=$(field translated   "$PREV_LINE")
-            PREV_FUZZY=$(field fuzzy        "$PREV_LINE")
-            PREV_UNTR=$(field  untranslated "$PREV_LINE")
+            read PREV_TRANS PREV_FUZZY PREV_UNTR <<<"$(po_stats /tmp/prev.po)"
             PREV_TOTAL=$((PREV_TRANS + PREV_FUZZY + PREV_UNTR))
           else
             PREV_TRANS=0; PREV_FUZZY=0; PREV_UNTR=0; PREV_TOTAL=0
@@ -175,31 +205,31 @@ jobs:
           {
             echo "changes<<CHG_EOF"
             if [ -z "$PREV_REF" ]; then
-              echo "_This is the **first tagged release**. The archives contain the full contents of both mods._"
+              echo "_هذا هو **أول إصدار رسمي**. تحتوي الأرشيفات على المحتوى الكامل لكلتا الإضافتين._"
             else
               ARABIC_N=$(git diff --name-only "$PREV_REF" HEAD -- Arabic/      | wc -l | tr -d ' ')
               FIXER_N=$( git diff --name-only "$PREV_REF" HEAD -- ArabicFixer/ | wc -l | tr -d ' ')
 
-              echo "Comparing \`${{ steps.tag.outputs.tag }}\` against \`$PREV_REF\`:"
+              echo "مقارنة الإصدار \`${{ steps.tag.outputs.tag }}\` مع الإصدار السابق \`$PREV_REF\`:"
               echo ""
-              echo "#### Arabic/ — $ARABIC_N file(s) changed"
+              echo "#### مجلد \`Arabic/\` — عدد الملفات المتغيرة: $ARABIC_N"
               if [ "$ARABIC_N" -gt 0 ]; then
                 echo ""
                 echo '```'
                 git diff --name-status "$PREV_REF" HEAD -- Arabic/
                 echo '```'
               else
-                echo "_No changes._"
+                echo "_لا توجد تغييرات._"
               fi
               echo ""
-              echo "#### ArabicFixer/ — $FIXER_N file(s) changed"
+              echo "#### مجلد \`ArabicFixer/\` — عدد الملفات المتغيرة: $FIXER_N"
               if [ "$FIXER_N" -gt 0 ]; then
                 echo ""
                 echo '```'
                 git diff --name-status "$PREV_REF" HEAD -- ArabicFixer/
                 echo '```'
               else
-                echo "_No changes._"
+                echo "_لا توجد تغييرات._"
               fi
             fi
             echo "CHG_EOF"
@@ -249,70 +279,85 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # -------------------------------------------------------------------
-      # 11. Compose the English release notes
+      # 11. Compose the Arabic release notes
+      #
+      # All narrative is in Arabic and wrapped in <div dir="rtl"> so GitHub
+      # renders it right-to-left on the Releases page. Technical tokens
+      # (file names, paths, commands, hashes, commit lines) stay LTR
+      # because they sit inside code spans / code blocks.
       # -------------------------------------------------------------------
       - name: Compose release notes
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           cat > release_notes.md <<EOF
-          # Oxygen Not Included — Arabic ${TAG}
+          <div dir="rtl">
 
-          Full Arabic localization for *Oxygen Not Included* with proper Right-to-Left rendering.
+          تعريب كامل للعبة *Oxygen Not Included* مع دعم حقيقي للكتابة من اليمين إلى اليسار وإصلاح عرض الحروف العربية.
 
-          ## Downloads
+          ## 📦 ملفات التحميل
 
-          | File | Contents | Recommended for |
+          | الملف | المحتوى | الاستخدام الموصى به |
           |---|---|---|
-          | **Oxygen-not-included-Arabic-${TAG}.zip** | Both \`Arabic/\` and \`ArabicFixer/\` folders | Most users — drop both folders into your \`Local\` mods directory |
-          | **Arabic-${TAG}.zip** | Translation mod only | Translators / standalone install |
-          | **ArabicFixer-${TAG}.zip** | RTL renderer DLL only | Standalone install |
+          | **Oxygen-not-included-Arabic-${TAG}.zip** | المجلدان \`Arabic/\` و \`ArabicFixer/\` معاً | الخيار الموصى به لمعظم المستخدمين — انسخ المجلدين إلى مجلد \`Local\` |
+          | **Arabic-${TAG}.zip** | إضافة الترجمة فقط | للمترجمين أو للتثبيت المنفصل |
+          | **ArabicFixer-${TAG}.zip** | إضافة إصلاح العرض فقط (DLL) | للتثبيت المنفصل |
 
-          ## Mod versions
+          ## 🔢 إصدارات الإضافات
 
-          - **Arabic RTL** — v${{ steps.versions.outputs.arabic }}
-          - **Arabic Text Fix** — v${{ steps.versions.outputs.fixer }}
+          - **التعريب العربي (Arabic RTL)** — الإصدار \`v${{ steps.versions.outputs.arabic }}\`
+          - **المصحح العربي (Arabic Text Fix)** — الإصدار \`v${{ steps.versions.outputs.fixer }}\`
 
-          ## Translation coverage
+          ## 📊 إحصائيات الترجمة
 
-          - **Translated strings:** ${{ steps.stats.outputs.now_trans }} / ${{ steps.stats.outputs.now_total }} (**${{ steps.stats.outputs.coverage }}%**)
-          - **Fuzzy:** ${{ steps.stats.outputs.now_fuzzy }} &nbsp;·&nbsp; **Untranslated:** ${{ steps.stats.outputs.now_untr }}
-          - **New / updated translations since last release:** ${{ steps.stats.outputs.delta_trans }}
-          - **New string entries since last release:** ${{ steps.stats.outputs.delta_total }}
+          - **النصوص المترجمة:** \`${{ steps.stats.outputs.now_trans }}\` من أصل \`${{ steps.stats.outputs.now_total }}\` (**نسبة التغطية: ${{ steps.stats.outputs.coverage }}%**)
+          - **النصوص الغامضة (Fuzzy):** \`${{ steps.stats.outputs.now_fuzzy }}\` &nbsp;·&nbsp; **النصوص غير المترجمة:** \`${{ steps.stats.outputs.now_untr }}\`
+          - **ترجمات جديدة أو محدّثة منذ الإصدار السابق:** \`${{ steps.stats.outputs.delta_trans }}\`
+          - **نصوص جديدة أضافتها اللعبة منذ الإصدار السابق:** \`${{ steps.stats.outputs.delta_total }}\`
 
-          ## Arabic Text Fix DLL
+          ## 🛠️ معلومات ملف الإصلاح (Arabic Text Fix)
 
-          - **SHA-256:** \`${{ steps.dll.outputs.hash }}\`
-          - **Updated this release:** \`${{ steps.dll.outputs.changed }}\`
+          - **بصمة الملف SHA-256:** \`${{ steps.dll.outputs.hash }}\`
+          - **هل تم تحديث الـ DLL في هذا الإصدار؟** \`${{ steps.dll.outputs.changed }}\`
 
-          ## What changed
+          ## 📝 التغييرات في هذا الإصدار
 
           ${{ steps.diff.outputs.changes }}
 
-          ## Commits
+          ## 📜 سجل الـ Commits
 
           ${{ steps.log.outputs.commits }}
 
           ---
 
-          ## Installation
+          ## 🚀 طريقة التثبيت
 
-          ### Steam users
-          Subscribe to **Arabic RTL** and **Arabic Text Fix** via the in-game Workshop browser — Steam delivers updates automatically.
+          ### 🅰️ لمستخدمي ستيم
+          اشترك في الإضافتين **Arabic RTL** و **Arabic Text Fix** من ورشة عمل ستيم داخل اللعبة، وستحصل على التحديثات تلقائياً.
 
-          ### Non-Steam / manual install (Epic, GOG, Game Pass, …)
-          1. Download **Oxygen-not-included-Arabic-${TAG}.zip** from the assets below.
-          2. Extract it into your local mods folder:
-             - **Windows:** \`%USERPROFILE%\\Documents\\Klei\\OxygenNotIncluded\\mods\\Local\\\`
-             - **macOS:** \`~/Library/Application Support/Klei/OxygenNotIncluded/mods/Local/\`
-             - **Linux:** \`~/.config/unity3d/Klei/Oxygen Not Included/mods/Local/\`
-          3. Launch the game → **Mods** → enable **both** mods → **Restart**.
-          4. **Options → General → Language → Arabic**.
+          ### 🅱️ للتثبيت اليدوي (لغير مستخدمي ستيم: Epic / GOG / Game Pass)
+          1. حمّل ملف **Oxygen-not-included-Arabic-${TAG}.zip** من قسم Assets أدناه.
+          2. فك ضغطه داخل مجلد الإضافات المحلية:
+             - **🪟 ويندوز:** \`%USERPROFILE%\\Documents\\Klei\\OxygenNotIncluded\\mods\\Local\\\`
+             - **🍎 ماك:** \`~/Library/Application Support/Klei/OxygenNotIncluded/mods/Local/\`
+             - **🐧 لينكس:** \`~/.config/unity3d/Klei/Oxygen Not Included/mods/Local/\`
+          3. شغّل اللعبة → **Mods** → فعّل **كلتا** الإضافتين → **Restart**.
+          4. اذهب إلى **Options → General → Language** واختر **Arabic**.
 
-          See the [project README](https://github.com/${{ github.repository }}#readme) for the full guide and troubleshooting.
+          لمزيد من التفاصيل والمساعدة في حل المشكلات، راجع [ملف README الخاص بالمشروع](https://github.com/${{ github.repository }}#readme).
 
           ---
 
-          _This release was built and published automatically by [\`.github/workflows/release.yml\`](https://github.com/${{ github.repository }}/blob/main/.github/workflows/release.yml)._
+          _تم بناء ونشر هذا الإصدار تلقائياً عبر [\`.github/workflows/release.yml\`](https://github.com/${{ github.repository }}/blob/main/.github/workflows/release.yml)._
+
+          </div>
+
+          ---
+
+          <div align="center">
+
+          **⭐ إذا أعجبك المشروع، لا تنسَ وضع نجمة على المستودع ⭐**
+
+          </div>
           EOF
 
           echo "---------- release_notes.md ----------"
@@ -326,7 +371,7 @@ jobs:
       - name: Write job summary
         run: |
           {
-            echo "# Release ${{ steps.tag.outputs.tag }} — preview"
+            echo "# معاينة إصدار ${{ steps.tag.outputs.tag }}"
             echo ""
             cat release_notes.md
           } >> "$GITHUB_STEP_SUMMARY"
