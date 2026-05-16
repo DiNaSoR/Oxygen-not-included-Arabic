@@ -1,0 +1,349 @@
+name: Release Mods
+
+# Packages the Arabic translation and ArabicFixer mods into ZIP files,
+# computes the diff against the previous release, and publishes a GitHub
+# Release with auto-generated English release notes.
+#
+# Triggers:
+#   - Push a tag matching v*  (e.g. `git tag v1.3.0 && git push --tags`)
+#   - Manually via the Actions tab (workflow_dispatch) with a tag input
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.3.0). Will be created if it doesn't exist."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------------------
+      # 1. Checkout (full history needed to diff against previous tag)
+      # -------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------------------
+      # 2. Install gettext (for msgfmt --statistics) and zip
+      # -------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gettext zip
+
+      # -------------------------------------------------------------------
+      # 3. Resolve the release tag (from push event or manual input)
+      # -------------------------------------------------------------------
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release tag::Building $TAG (version $VERSION)"
+
+      # -------------------------------------------------------------------
+      # 4. Find the previous release tag (for diff). Falls back to "first
+      #    release" mode if no earlier tag exists.
+      # -------------------------------------------------------------------
+      - name: Find previous tag
+        id: prev
+        run: |
+          CURRENT="${{ steps.tag.outputs.tag }}"
+          PREV=$(git tag --sort=-v:refname | grep -E '^v' | grep -v "^${CURRENT}$" | head -n1 || true)
+          if [ -z "$PREV" ]; then
+            echo "is_first=true" >> "$GITHUB_OUTPUT"
+            echo "ref="          >> "$GITHUB_OUTPUT"
+            echo "::notice title=First release::No previous tag found — generating notes for initial release."
+          else
+            echo "is_first=false" >> "$GITHUB_OUTPUT"
+            echo "ref=$PREV"      >> "$GITHUB_OUTPUT"
+            echo "::notice title=Previous tag::Comparing against $PREV"
+          fi
+
+      # -------------------------------------------------------------------
+      # 5. Read each mod's declared version (fallback: mod_info.yaml)
+      # -------------------------------------------------------------------
+      - name: Read mod versions
+        id: versions
+        run: |
+          extract_version() {
+            grep -E '^[[:space:]]*version:' "$1" 2>/dev/null | head -n1 \
+              | sed -E 's/^[[:space:]]*version:[[:space:]]*"?([^"#]+)"?.*$/\1/' \
+              | tr -d ' "'
+          }
+          ARABIC_VER=$(extract_version Arabic/mod.yaml)
+          [ -z "$ARABIC_VER" ] && ARABIC_VER=$(extract_version Arabic/mod_info.yaml)
+          FIXER_VER=$(extract_version ArabicFixer/mod.yaml)
+          [ -z "$FIXER_VER" ] && FIXER_VER=$(extract_version ArabicFixer/mod_info.yaml)
+          [ -z "$ARABIC_VER" ] && ARABIC_VER="unknown"
+          [ -z "$FIXER_VER" ]  && FIXER_VER="unknown"
+          echo "arabic=$ARABIC_VER" >> "$GITHUB_OUTPUT"
+          echo "fixer=$FIXER_VER"   >> "$GITHUB_OUTPUT"
+          echo "Arabic mod version:     v$ARABIC_VER"
+          echo "ArabicFixer mod version: v$FIXER_VER"
+
+      # -------------------------------------------------------------------
+      # 6. Compute translation coverage stats (now vs previous tag)
+      # -------------------------------------------------------------------
+      - name: Compute translation stats
+        id: stats
+        run: |
+          stats_line() { msgfmt --statistics -o /dev/null "$1" 2>&1 | head -n1; }
+          field()      { echo "$2" | grep -oE "[0-9]+ $1" | grep -oE '^[0-9]+' || echo 0; }
+
+          NOW_LINE=$(stats_line Arabic/strings.po)
+          NOW_TRANS=$(field translated   "$NOW_LINE")
+          NOW_FUZZY=$(field fuzzy        "$NOW_LINE")
+          NOW_UNTR=$(field  untranslated "$NOW_LINE")
+          NOW_TOTAL=$((NOW_TRANS + NOW_FUZZY + NOW_UNTR))
+
+          PREV_REF="${{ steps.prev.outputs.ref }}"
+          if [ -n "$PREV_REF" ] && git show "$PREV_REF:Arabic/strings.po" > /tmp/prev.po 2>/dev/null; then
+            PREV_LINE=$(stats_line /tmp/prev.po)
+            PREV_TRANS=$(field translated   "$PREV_LINE")
+            PREV_FUZZY=$(field fuzzy        "$PREV_LINE")
+            PREV_UNTR=$(field  untranslated "$PREV_LINE")
+            PREV_TOTAL=$((PREV_TRANS + PREV_FUZZY + PREV_UNTR))
+          else
+            PREV_TRANS=0; PREV_FUZZY=0; PREV_UNTR=0; PREV_TOTAL=0
+          fi
+
+          DELTA_TRANS=$((NOW_TRANS - PREV_TRANS))
+          DELTA_TOTAL=$((NOW_TOTAL - PREV_TOTAL))
+          if [ "$NOW_TOTAL" -gt 0 ]; then
+            COVERAGE=$(awk "BEGIN { printf \"%.1f\", $NOW_TRANS * 100 / $NOW_TOTAL }")
+          else
+            COVERAGE="0.0"
+          fi
+
+          {
+            echo "now_trans=$NOW_TRANS"
+            echo "now_total=$NOW_TOTAL"
+            echo "now_fuzzy=$NOW_FUZZY"
+            echo "now_untr=$NOW_UNTR"
+            echo "delta_trans=$DELTA_TRANS"
+            echo "delta_total=$DELTA_TOTAL"
+            echo "coverage=$COVERAGE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Coverage: $NOW_TRANS / $NOW_TOTAL ($COVERAGE%)  |  Δ translated: $DELTA_TRANS  |  Δ total: $DELTA_TOTAL"
+
+      # -------------------------------------------------------------------
+      # 7. Hash the fixer DLL and detect whether it changed
+      # -------------------------------------------------------------------
+      - name: Detect DLL changes
+        id: dll
+        run: |
+          NOW_HASH=$(sha256sum ArabicFixer/ArabicTextFixMod.dll | cut -d' ' -f1)
+          PREV_REF="${{ steps.prev.outputs.ref }}"
+          CHANGED=true
+          PREV_HASH=""
+          if [ -n "$PREV_REF" ] && git show "$PREV_REF:ArabicFixer/ArabicTextFixMod.dll" > /tmp/prev.dll 2>/dev/null; then
+            PREV_HASH=$(sha256sum /tmp/prev.dll | cut -d' ' -f1)
+            [ "$NOW_HASH" = "$PREV_HASH" ] && CHANGED=false
+          fi
+          echo "hash=$NOW_HASH"     >> "$GITHUB_OUTPUT"
+          echo "prev_hash=$PREV_HASH" >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED"   >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # 8. Compute per-folder file change list
+      # -------------------------------------------------------------------
+      - name: Build change summary
+        id: diff
+        run: |
+          PREV_REF="${{ steps.prev.outputs.ref }}"
+          {
+            echo "changes<<CHG_EOF"
+            if [ -z "$PREV_REF" ]; then
+              echo "_This is the **first tagged release**. The archives contain the full contents of both mods._"
+            else
+              ARABIC_N=$(git diff --name-only "$PREV_REF" HEAD -- Arabic/      | wc -l | tr -d ' ')
+              FIXER_N=$( git diff --name-only "$PREV_REF" HEAD -- ArabicFixer/ | wc -l | tr -d ' ')
+
+              echo "Comparing \`${{ steps.tag.outputs.tag }}\` against \`$PREV_REF\`:"
+              echo ""
+              echo "#### Arabic/ — $ARABIC_N file(s) changed"
+              if [ "$ARABIC_N" -gt 0 ]; then
+                echo ""
+                echo '```'
+                git diff --name-status "$PREV_REF" HEAD -- Arabic/
+                echo '```'
+              else
+                echo "_No changes._"
+              fi
+              echo ""
+              echo "#### ArabicFixer/ — $FIXER_N file(s) changed"
+              if [ "$FIXER_N" -gt 0 ]; then
+                echo ""
+                echo '```'
+                git diff --name-status "$PREV_REF" HEAD -- ArabicFixer/
+                echo '```'
+              else
+                echo "_No changes._"
+              fi
+            fi
+            echo "CHG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # 9. Collect commit log between the two tags
+      # -------------------------------------------------------------------
+      - name: Collect commit log
+        id: log
+        run: |
+          PREV_REF="${{ steps.prev.outputs.ref }}"
+          {
+            echo "commits<<LOG_EOF"
+            if [ -z "$PREV_REF" ]; then
+              git log --pretty=format:"- %s (%h) — _%an_" | head -n 30
+            else
+              git log "$PREV_REF..HEAD" --pretty=format:"- %s (%h) — _%an_"
+            fi
+            echo ""
+            echo "LOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # 10. Build the ZIP archives
+      #
+      #     Three artifacts:
+      #       * Oxygen-not-included-Arabic-<tag>.zip — both folders (drop into Local/)
+      #       * Arabic-<tag>.zip                     — translation mod only
+      #       * ArabicFixer-<tag>.zip                — RTL renderer only
+      # -------------------------------------------------------------------
+      - name: Build ZIP archives
+        id: zips
+        run: |
+          mkdir -p dist
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          zip -r -q "dist/Arabic-${TAG}.zip"                       Arabic
+          zip -r -q "dist/ArabicFixer-${TAG}.zip"                  ArabicFixer
+          zip -r -q "dist/Oxygen-not-included-Arabic-${TAG}.zip"   Arabic ArabicFixer
+
+          ls -lh dist/
+          {
+            echo "arabic=dist/Arabic-${TAG}.zip"
+            echo "fixer=dist/ArabicFixer-${TAG}.zip"
+            echo "bundle=dist/Oxygen-not-included-Arabic-${TAG}.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # 11. Compose the English release notes
+      # -------------------------------------------------------------------
+      - name: Compose release notes
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          cat > release_notes.md <<EOF
+          # Oxygen Not Included — Arabic ${TAG}
+
+          Full Arabic localization for *Oxygen Not Included* with proper Right-to-Left rendering.
+
+          ## Downloads
+
+          | File | Contents | Recommended for |
+          |---|---|---|
+          | **Oxygen-not-included-Arabic-${TAG}.zip** | Both \`Arabic/\` and \`ArabicFixer/\` folders | Most users — drop both folders into your \`Local\` mods directory |
+          | **Arabic-${TAG}.zip** | Translation mod only | Translators / standalone install |
+          | **ArabicFixer-${TAG}.zip** | RTL renderer DLL only | Standalone install |
+
+          ## Mod versions
+
+          - **Arabic RTL** — v${{ steps.versions.outputs.arabic }}
+          - **Arabic Text Fix** — v${{ steps.versions.outputs.fixer }}
+
+          ## Translation coverage
+
+          - **Translated strings:** ${{ steps.stats.outputs.now_trans }} / ${{ steps.stats.outputs.now_total }} (**${{ steps.stats.outputs.coverage }}%**)
+          - **Fuzzy:** ${{ steps.stats.outputs.now_fuzzy }} &nbsp;·&nbsp; **Untranslated:** ${{ steps.stats.outputs.now_untr }}
+          - **New / updated translations since last release:** ${{ steps.stats.outputs.delta_trans }}
+          - **New string entries since last release:** ${{ steps.stats.outputs.delta_total }}
+
+          ## Arabic Text Fix DLL
+
+          - **SHA-256:** \`${{ steps.dll.outputs.hash }}\`
+          - **Updated this release:** \`${{ steps.dll.outputs.changed }}\`
+
+          ## What changed
+
+          ${{ steps.diff.outputs.changes }}
+
+          ## Commits
+
+          ${{ steps.log.outputs.commits }}
+
+          ---
+
+          ## Installation
+
+          ### Steam users
+          Subscribe to **Arabic RTL** and **Arabic Text Fix** via the in-game Workshop browser — Steam delivers updates automatically.
+
+          ### Non-Steam / manual install (Epic, GOG, Game Pass, …)
+          1. Download **Oxygen-not-included-Arabic-${TAG}.zip** from the assets below.
+          2. Extract it into your local mods folder:
+             - **Windows:** \`%USERPROFILE%\\Documents\\Klei\\OxygenNotIncluded\\mods\\Local\\\`
+             - **macOS:** \`~/Library/Application Support/Klei/OxygenNotIncluded/mods/Local/\`
+             - **Linux:** \`~/.config/unity3d/Klei/Oxygen Not Included/mods/Local/\`
+          3. Launch the game → **Mods** → enable **both** mods → **Restart**.
+          4. **Options → General → Language → Arabic**.
+
+          See the [project README](https://github.com/${{ github.repository }}#readme) for the full guide and troubleshooting.
+
+          ---
+
+          _This release was built and published automatically by [\`.github/workflows/release.yml\`](https://github.com/${{ github.repository }}/blob/main/.github/workflows/release.yml)._
+          EOF
+
+          echo "---------- release_notes.md ----------"
+          cat release_notes.md
+          echo "--------------------------------------"
+
+      # -------------------------------------------------------------------
+      # 12. Mirror the release notes to the Actions run summary so the
+      #     maintainer can preview before they go live.
+      # -------------------------------------------------------------------
+      - name: Write job summary
+        run: |
+          {
+            echo "# Release ${{ steps.tag.outputs.tag }} — preview"
+            echo ""
+            cat release_notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -------------------------------------------------------------------
+      # 13. Publish the GitHub Release with all three ZIPs attached
+      # -------------------------------------------------------------------
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Oxygen Not Included — Arabic ${{ steps.tag.outputs.tag }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/Arabic-${{ steps.tag.outputs.tag }}.zip
+            dist/ArabicFixer-${{ steps.tag.outputs.tag }}.zip
+            dist/Oxygen-not-included-Arabic-${{ steps.tag.outputs.tag }}.zip
